@@ -40,7 +40,13 @@
             z-index: 1000;
         }
 
-        #controls {
+        .leaflet-top,
+        .leaflet-bottom,
+        .leaflet-control {
+            z-index: 1001 !important;
+        }
+
+        #controls-top-right {
             position: absolute;
             top: 10px;
             right: 10px;
@@ -48,6 +54,20 @@
             display: flex;
             flex-direction: column;
             gap: 10px;
+        }
+
+        #controls-bottom-left {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            z-index: 1001;
+        }
+
+        #controls-bottom-right {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+            z-index: 1001;
         }
 
         button {
@@ -76,17 +96,40 @@
             transform: scale(0.95);
         }
 
-        #center-btn {
+        button {
             background: white;
-            color: #007bff;
+            color: #000;
         }
 
-        #reset-btn {
+        #radius-control {
             background: white;
-            color: #dc3545;
+            padding: 10px 12px;
+            border-radius: 22px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        #radius-slider {
+            width: 80px;
+            cursor: pointer;
+        }
+
+        #radius-value {
+            min-width: 35px;
+            text-align: right;
         }
 
         .error {
+            position: absolute;
+            top: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1001;
             color: #dc3545;
             font-size: 12px;
             background: white;
@@ -100,17 +143,33 @@
         .error:not(:empty) {
             display: block;
         }
+
+        .satellite-layer {
+            filter: brightness(0.6) contrast(1.1);
+        }
     </style>
 </head>
 <body>
     <div id="map"></div>
     <canvas id="fog-canvas"></canvas>
 
-    <div id="controls">
+    <div id="controls-top-right">
         <button id="center-btn" title="Center on My Location">⊙</button>
         <button id="reset-btn" title="Reset All Data">↻</button>
-        <div id="error-msg" class="error"></div>
     </div>
+
+    <div id="controls-bottom-left">
+        <button id="basemap-btn" title="Toggle Satellite/Street">◐</button>
+    </div>
+
+    <div id="controls-bottom-right">
+        <div id="radius-control">
+            <input type="range" id="radius-slider" min="15" max="100" value="20" step="5">
+            <span id="radius-value">20m</span>
+        </div>
+    </div>
+
+    <div id="error-msg" class="error"></div>
 
     <!-- Leaflet JS -->
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
@@ -140,7 +199,17 @@
             currentPosition: null,
             currentMarker: null,
             watchId: null,
-            lastSaveTime: 0
+            lastSaveTime: 0,
+            noiseCanvas: null,
+            noiseCtx: null,
+            streetLayer: null,
+            satelliteLayer: null,
+            currentLayer: 'satellite',
+            hasInitialCentered: false,
+            currentAccuracy: null,
+            animationFrame: null,
+            animationStartTime: Date.now(),
+            lastAnimationFrame: 0
         };
 
         // Initialize the application
@@ -150,20 +219,30 @@
             loadFromLocalStorage();
             initGeolocation();
             setupEventListeners();
-            drawFog();
+            animateFog(); // Start animation loop
         }
 
         // Initialize Leaflet map
         function initMap() {
-            state.map = L.map('map').setView(CONFIG.DEFAULT_CENTER, CONFIG.DEFAULT_ZOOM);
+            state.map = L.map('map', {
+                attributionControl: false
+            }).setView(CONFIG.DEFAULT_CENTER, CONFIG.DEFAULT_ZOOM);
 
-            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                attribution: '© OpenStreetMap contributors',
+            // Create dark layer (Carto Dark Matter)
+            state.streetLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+                attribution: '© OpenStreetMap contributors © CARTO',
                 maxZoom: 19
-            }).addTo(state.map);
+            });
 
-            // Listen to map events for fog redraw
-            state.map.on('move zoom resize', drawFog);
+            // Create satellite layer (Esri World Imagery)
+            state.satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+                attribution: '© Esri',
+                maxZoom: 19,
+                className: 'satellite-layer'
+            });
+
+            // Start with satellite layer
+            state.satelliteLayer.addTo(state.map);
         }
 
         // Initialize fog canvas
@@ -214,6 +293,93 @@
             return meters / metersPerPixel;
         }
 
+        // Simple hash function for pseudo-random noise
+        function hash(x, y) {
+            const h = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453;
+            return h - Math.floor(h);
+        }
+
+        // Smoothstep interpolation
+        function smoothstep(t) {
+            return t * t * (3 - 2 * t);
+        }
+
+        // 2D Perlin-like noise
+        function noise(x, y) {
+            const xi = Math.floor(x);
+            const yi = Math.floor(y);
+            const xf = x - xi;
+            const yf = y - yi;
+
+            const n00 = hash(xi, yi);
+            const n10 = hash(xi + 1, yi);
+            const n01 = hash(xi, yi + 1);
+            const n11 = hash(xi + 1, yi + 1);
+
+            const u = smoothstep(xf);
+            const v = smoothstep(yf);
+
+            const nx0 = n00 * (1 - u) + n10 * u;
+            const nx1 = n01 * (1 - u) + n11 * u;
+
+            return nx0 * (1 - v) + nx1 * v;
+        }
+
+        // Multi-octave noise (Fractal Brownian Motion)
+        function fbm(x, y, octaves = 4) {
+            let value = 0;
+            let amplitude = 1;
+            let frequency = 1;
+            let maxValue = 0;
+
+            for (let i = 0; i < octaves; i++) {
+                value += noise(x * frequency, y * frequency) * amplitude;
+                maxValue += amplitude;
+                amplitude *= 0.5;
+                frequency *= 2;
+            }
+
+            return value / maxValue;
+        }
+
+        // Generate cloudy fog texture with time offset for animation
+        function generateCloudTexture(width, height, timeOffset = 0) {
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+
+            const imageData = ctx.createImageData(width, height);
+            const data = imageData.data;
+
+            const scale = 0.005; // Adjust for cloud size
+
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width; x++) {
+                    const i = (y * width + x) * 4;
+
+                    // Multi-octave noise for realistic clouds with time offset
+                    const noiseValue = fbm(
+                        x * scale + timeOffset * 2,
+                        y * scale + timeOffset * 1,
+                        5
+                    );
+
+                    // Map noise to white/gray fog colors
+                    const brightness = 200 + noiseValue * 55; // 200-255 range
+                    const alpha = 0.85 + noiseValue * 0.15; // Varying opacity
+
+                    data[i] = brightness;     // R
+                    data[i + 1] = brightness; // G
+                    data[i + 2] = brightness; // B
+                    data[i + 3] = alpha * 255; // A
+                }
+            }
+
+            ctx.putImageData(imageData, 0, 0);
+            return canvas;
+        }
+
         // Draw fog with reveals
         function drawFog() {
             if (!state.ctx || !state.canvas) return;
@@ -224,9 +390,17 @@
             // Clear canvas
             ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-            // Fill with fog
-            ctx.fillStyle = CONFIG.FOG_COLOR;
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            // Calculate time offset for animation (very subtle drift)
+            const timeOffset = (Date.now() - state.animationStartTime) / 12000;
+
+            // Generate at half resolution for performance, then scale up
+            const texWidth = Math.floor(canvas.width / 2);
+            const texHeight = Math.floor(canvas.height / 2);
+            state.noiseCanvas = generateCloudTexture(texWidth, texHeight, timeOffset);
+
+            // Draw scaled up (4x faster generation, minimal visual difference)
+            ctx.imageSmoothingEnabled = true;
+            ctx.drawImage(state.noiseCanvas, 0, 0, canvas.width, canvas.height);
 
             // Set composite mode to "erase" fog
             ctx.globalCompositeOperation = 'destination-out';
@@ -244,23 +418,54 @@
                 const coords = latLngToCanvasCoords(location.lat, location.lng);
                 const radiusPixels = metersToPixels(location.radius, location.lat);
 
-                // Create radial gradient for soft edges
-                const gradient = ctx.createRadialGradient(
-                    coords.x, coords.y, 0,
-                    coords.x, coords.y, radiusPixels
-                );
-                gradient.addColorStop(0, 'rgba(0, 0, 0, 1)');
-                gradient.addColorStop(0.7, 'rgba(0, 0, 0, 0.8)');
-                gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+                // Draw multiple concentric wavy rings with decreasing opacity for fadeout
+                const numRings = 100;
+                const noiseScale = 0.3;
+                const segments = 1000;
 
-                ctx.fillStyle = gradient;
-                ctx.beginPath();
-                ctx.arc(coords.x, coords.y, radiusPixels, 0, Math.PI * 2);
-                ctx.fill();
+                for (let ring = 0; ring < numRings; ring++) {
+                    const ringProgress = ring / numRings; // 0 to ~0.875
+                    const ringRadius = radiusPixels * (0.5 + ringProgress * 1.0); // 0.5x to 1.5x base radius
+                    const ringAlpha = 1.0 - (ringProgress * ringProgress); // Quadratic falloff for smoother fade
+
+                    ctx.fillStyle = `rgba(0, 0, 0, ${ringAlpha})`;
+
+                    // Draw wavy shape for this ring
+                    ctx.beginPath();
+
+                    for (let i = 0; i <= segments; i++) {
+                        const angle = (i / segments) * Math.PI * 2;
+
+                        const noiseValue = fbm(
+                            location.lat * 1000 + Math.cos(angle) * 5 + timeOffset * 3,
+                            location.lng * 1000 + Math.sin(angle) * 5 + timeOffset * 2,
+                            2
+                        );
+                        const radiusVariation = 1 + (noiseValue - 0.5) * noiseScale;
+                        const variedRadius = ringRadius * radiusVariation;
+
+                        const x = coords.x + Math.cos(angle) * variedRadius;
+                        const y = coords.y + Math.sin(angle) * variedRadius;
+
+                        if (i === 0) {
+                            ctx.moveTo(x, y);
+                        } else {
+                            ctx.lineTo(x, y);
+                        }
+                    }
+                    ctx.closePath();
+                    ctx.fill();
+                }
             });
 
             // Reset composite mode
             ctx.globalCompositeOperation = 'source-over';
+        }
+
+        // Animation loop for cloud drift (60fps for smooth animation)
+        function animateFog(timestamp) {
+            drawFog();
+            state.animationFrame = requestAnimationFrame(animateFog);
         }
 
         // Initialize Geolocation
@@ -292,6 +497,15 @@
                 return;
             }
 
+            // Store current accuracy
+            state.currentAccuracy = accuracy;
+
+            // Center map on user's location on first GPS fix
+            if (!state.hasInitialCentered) {
+                state.map.setView([latitude, longitude], 18);
+                state.hasInitialCentered = true;
+            }
+
             // Update current position marker
             updateCurrentMarker(latitude, longitude);
 
@@ -304,7 +518,7 @@
                 ) > CONFIG.GPS_MIN_MOVEMENT;
 
             if (shouldAddLocation) {
-                addVisitedLocation(latitude, longitude);
+                addVisitedLocation(latitude, longitude, accuracy);
             }
 
             state.currentPosition = { lat: latitude, lng: longitude };
@@ -330,7 +544,7 @@
         }
 
         // Add a new visited location
-        function addVisitedLocation(lat, lng) {
+        function addVisitedLocation(lat, lng, accuracy) {
             const location = {
                 lat: lat,
                 lng: lng,
@@ -375,6 +589,7 @@
                 const data = {
                     version: 1,
                     visitedLocations: state.visitedLocations,
+                    revealRadius: CONFIG.FOG_REVEAL_RADIUS,
                     timestamp: now
                 };
                 localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(data));
@@ -391,6 +606,23 @@
                 if (dataStr) {
                     const data = JSON.parse(dataStr);
                     state.visitedLocations = data.visitedLocations || [];
+
+                    // Restore slider value if saved
+                    if (data.revealRadius) {
+                        CONFIG.FOG_REVEAL_RADIUS = data.revealRadius;
+                        const slider = document.getElementById('radius-slider');
+                        const valueDisplay = document.getElementById('radius-value');
+                        if (slider && valueDisplay) {
+                            slider.value = data.revealRadius;
+                            valueDisplay.textContent = `${data.revealRadius}m`;
+                        }
+
+                        // Update all loaded locations to use saved radius
+                        state.visitedLocations.forEach(location => {
+                            location.radius = data.revealRadius;
+                        });
+                    }
+
                     drawFog();
                 }
             } catch (error) {
@@ -413,19 +645,49 @@
         // Center map on current location
         function centerOnCurrentLocation() {
             if (state.currentPosition) {
-                state.map.setView([state.currentPosition.lat, state.currentPosition.lng], 16);
+                state.map.panTo([state.currentPosition.lat, state.currentPosition.lng]);
             } else if (state.visitedLocations.length > 0) {
                 const lastLocation = state.visitedLocations[state.visitedLocations.length - 1];
-                state.map.setView([lastLocation.lat, lastLocation.lng], 16);
+                state.map.panTo([lastLocation.lat, lastLocation.lng]);
             } else {
                 showError('No location available yet');
+            }
+        }
+
+        // Toggle basemap between street and satellite
+        function toggleBasemap() {
+            if (state.currentLayer === 'street') {
+                state.map.removeLayer(state.streetLayer);
+                state.satelliteLayer.addTo(state.map);
+                state.currentLayer = 'satellite';
+            } else {
+                state.map.removeLayer(state.satelliteLayer);
+                state.streetLayer.addTo(state.map);
+                state.currentLayer = 'street';
             }
         }
 
         // Setup event listeners
         function setupEventListeners() {
             document.getElementById('center-btn').addEventListener('click', centerOnCurrentLocation);
+            document.getElementById('basemap-btn').addEventListener('click', toggleBasemap);
             document.getElementById('reset-btn').addEventListener('click', clearAllData);
+
+            const radiusSlider = document.getElementById('radius-slider');
+            const radiusValue = document.getElementById('radius-value');
+
+            radiusSlider.addEventListener('input', (e) => {
+                const newRadius = parseInt(e.target.value);
+                CONFIG.FOG_REVEAL_RADIUS = newRadius;
+                radiusValue.textContent = `${newRadius}m`;
+
+                // Update all existing locations with new radius
+                state.visitedLocations.forEach(location => {
+                    location.radius = newRadius;
+                });
+
+                drawFog();
+            });
         }
 
         // Show error message
