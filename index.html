@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fog of War - Real World Map</title>
+
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+          integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+          crossorigin=""/>
+
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body, html {
+            width: 100%;
+            height: 100%;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            overflow: hidden;
+        }
+
+        #map {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+
+        #fog-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+            z-index: 1000;
+        }
+
+        #controls {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            z-index: 1001;
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+            max-width: 250px;
+        }
+
+        #status {
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 10px;
+            line-height: 1.4;
+        }
+
+        .status-label {
+            font-weight: 600;
+            color: #333;
+        }
+
+        button {
+            width: 100%;
+            padding: 10px;
+            margin-top: 8px;
+            border: none;
+            border-radius: 4px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        #center-btn {
+            background: #007bff;
+            color: white;
+        }
+
+        #center-btn:hover {
+            background: #0056b3;
+        }
+
+        #reset-btn {
+            background: #dc3545;
+            color: white;
+        }
+
+        #reset-btn:hover {
+            background: #c82333;
+        }
+
+        #reset-btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+
+        .error {
+            color: #dc3545;
+            font-size: 12px;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <canvas id="fog-canvas"></canvas>
+
+    <div id="controls">
+        <div id="status">
+            <div><span class="status-label">GPS:</span> <span id="gps-status">Initializing...</span></div>
+            <div><span class="status-label">Locations:</span> <span id="location-count">0</span></div>
+            <div><span class="status-label">Accuracy:</span> <span id="accuracy">--</span></div>
+        </div>
+        <button id="center-btn">Center on My Location</button>
+        <button id="reset-btn">Reset All Data</button>
+        <div id="error-msg" class="error"></div>
+    </div>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+            crossorigin=""></script>
+
+    <script>
+        // Configuration
+        const CONFIG = {
+            FOG_COLOR: 'rgba(0, 0, 0, 0.85)',
+            FOG_REVEAL_RADIUS: 100, // meters
+            GPS_MIN_MOVEMENT: 20, // meters
+            GPS_UPDATE_INTERVAL: 10000, // ms
+            GPS_MAX_ACCURACY: 100, // meters
+            MAX_STORED_POINTS: 10000,
+            STORAGE_KEY: 'fogOfWarData',
+            DEFAULT_CENTER: [40.7128, -74.0060], // NYC
+            DEFAULT_ZOOM: 13
+        };
+
+        // State
+        const state = {
+            map: null,
+            canvas: null,
+            ctx: null,
+            visitedLocations: [],
+            currentPosition: null,
+            currentMarker: null,
+            watchId: null,
+            lastSaveTime: 0
+        };
+
+        // Initialize the application
+        function init() {
+            initMap();
+            initFogCanvas();
+            loadFromLocalStorage();
+            initGeolocation();
+            setupEventListeners();
+            drawFog();
+        }
+
+        // Initialize Leaflet map
+        function initMap() {
+            state.map = L.map('map').setView(CONFIG.DEFAULT_CENTER, CONFIG.DEFAULT_ZOOM);
+
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© OpenStreetMap contributors',
+                maxZoom: 19
+            }).addTo(state.map);
+
+            // Listen to map events for fog redraw
+            state.map.on('move zoom resize', drawFog);
+        }
+
+        // Initialize fog canvas
+        function initFogCanvas() {
+            state.canvas = document.getElementById('fog-canvas');
+            state.ctx = state.canvas.getContext('2d');
+            resizeFogCanvas();
+
+            // Handle window resize
+            window.addEventListener('resize', () => {
+                resizeFogCanvas();
+                drawFog();
+            });
+        }
+
+        // Resize canvas to match map container
+        function resizeFogCanvas() {
+            const mapContainer = document.getElementById('map');
+            state.canvas.width = mapContainer.offsetWidth;
+            state.canvas.height = mapContainer.offsetHeight;
+        }
+
+        // Convert lat/lng to canvas pixel coordinates
+        function latLngToCanvasCoords(lat, lng) {
+            const point = state.map.latLngToContainerPoint([lat, lng]);
+            return { x: point.x, y: point.y };
+        }
+
+        // Calculate distance between two points in meters
+        function calculateDistance(lat1, lng1, lat2, lng2) {
+            const R = 6371000; // Earth's radius in meters
+            const φ1 = lat1 * Math.PI / 180;
+            const φ2 = lat2 * Math.PI / 180;
+            const Δφ = (lat2 - lat1) * Math.PI / 180;
+            const Δλ = (lng2 - lng1) * Math.PI / 180;
+
+            const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+                      Math.cos(φ1) * Math.cos(φ2) *
+                      Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+            return R * c;
+        }
+
+        // Convert meters to pixels at current zoom level
+        function metersToPixels(meters, lat) {
+            const metersPerPixel = 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, state.map.getZoom());
+            return meters / metersPerPixel;
+        }
+
+        // Draw fog with reveals
+        function drawFog() {
+            if (!state.ctx || !state.canvas) return;
+
+            const ctx = state.ctx;
+            const canvas = state.canvas;
+
+            // Clear canvas
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Fill with fog
+            ctx.fillStyle = CONFIG.FOG_COLOR;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Set composite mode to "erase" fog
+            ctx.globalCompositeOperation = 'destination-out';
+
+            // Get map bounds for viewport culling
+            const bounds = state.map.getBounds();
+
+            // Draw reveals for each visited location
+            state.visitedLocations.forEach(location => {
+                // Viewport culling - skip if outside visible area
+                if (!bounds.contains([location.lat, location.lng])) {
+                    return;
+                }
+
+                const coords = latLngToCanvasCoords(location.lat, location.lng);
+                const radiusPixels = metersToPixels(location.radius, location.lat);
+
+                // Create radial gradient for soft edges
+                const gradient = ctx.createRadialGradient(
+                    coords.x, coords.y, 0,
+                    coords.x, coords.y, radiusPixels
+                );
+                gradient.addColorStop(0, 'rgba(0, 0, 0, 1)');
+                gradient.addColorStop(0.7, 'rgba(0, 0, 0, 0.8)');
+                gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+
+                ctx.fillStyle = gradient;
+                ctx.beginPath();
+                ctx.arc(coords.x, coords.y, radiusPixels, 0, Math.PI * 2);
+                ctx.fill();
+            });
+
+            // Reset composite mode
+            ctx.globalCompositeOperation = 'source-over';
+        }
+
+        // Initialize Geolocation
+        function initGeolocation() {
+            if (!navigator.geolocation) {
+                showError('Geolocation is not supported by your browser');
+                updateStatus('gps-status', 'Not supported');
+                return;
+            }
+
+            updateStatus('gps-status', 'Requesting permission...');
+
+            const options = {
+                enableHighAccuracy: true,
+                maximumAge: 5000,
+                timeout: 10000
+            };
+
+            state.watchId = navigator.geolocation.watchPosition(
+                onPositionUpdate,
+                onPositionError,
+                options
+            );
+        }
+
+        // Handle position update
+        function onPositionUpdate(position) {
+            const { latitude, longitude, accuracy } = position.coords;
+
+            updateStatus('gps-status', 'Active');
+            updateStatus('accuracy', `±${Math.round(accuracy)}m`);
+
+            // Filter out low-accuracy readings
+            if (accuracy > CONFIG.GPS_MAX_ACCURACY) {
+                return;
+            }
+
+            // Update current position marker
+            updateCurrentMarker(latitude, longitude);
+
+            // Check if we should add a new visited location
+            const shouldAddLocation = state.visitedLocations.length === 0 ||
+                calculateDistance(
+                    latitude, longitude,
+                    state.visitedLocations[state.visitedLocations.length - 1].lat,
+                    state.visitedLocations[state.visitedLocations.length - 1].lng
+                ) > CONFIG.GPS_MIN_MOVEMENT;
+
+            if (shouldAddLocation) {
+                addVisitedLocation(latitude, longitude);
+            }
+
+            state.currentPosition = { lat: latitude, lng: longitude };
+        }
+
+        // Handle position error
+        function onPositionError(error) {
+            let message = '';
+            switch(error.code) {
+                case error.PERMISSION_DENIED:
+                    message = 'Location permission denied';
+                    break;
+                case error.POSITION_UNAVAILABLE:
+                    message = 'Location unavailable';
+                    break;
+                case error.TIMEOUT:
+                    message = 'Location request timeout';
+                    break;
+                default:
+                    message = 'Unknown location error';
+            }
+            showError(message);
+            updateStatus('gps-status', 'Error');
+        }
+
+        // Add a new visited location
+        function addVisitedLocation(lat, lng) {
+            const location = {
+                lat: lat,
+                lng: lng,
+                radius: CONFIG.FOG_REVEAL_RADIUS,
+                timestamp: Date.now()
+            };
+
+            state.visitedLocations.push(location);
+
+            // Cap at max points
+            if (state.visitedLocations.length > CONFIG.MAX_STORED_POINTS) {
+                state.visitedLocations.shift();
+            }
+
+            updateStatus('location-count', state.visitedLocations.length);
+            drawFog();
+            saveToLocalStorage();
+        }
+
+        // Update current position marker
+        function updateCurrentMarker(lat, lng) {
+            if (state.currentMarker) {
+                state.currentMarker.setLatLng([lat, lng]);
+            } else {
+                state.currentMarker = L.circleMarker([lat, lng], {
+                    radius: 8,
+                    color: '#007bff',
+                    fillColor: '#007bff',
+                    fillOpacity: 0.8,
+                    weight: 2
+                }).addTo(state.map);
+            }
+        }
+
+        // Save to localStorage
+        function saveToLocalStorage() {
+            // Debounce saves
+            const now = Date.now();
+            if (now - state.lastSaveTime < 5000) return;
+            state.lastSaveTime = now;
+
+            try {
+                const data = {
+                    version: 1,
+                    visitedLocations: state.visitedLocations,
+                    timestamp: now
+                };
+                localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(data));
+            } catch (error) {
+                console.error('Failed to save to localStorage:', error);
+                showError('Failed to save data');
+            }
+        }
+
+        // Load from localStorage
+        function loadFromLocalStorage() {
+            try {
+                const dataStr = localStorage.getItem(CONFIG.STORAGE_KEY);
+                if (dataStr) {
+                    const data = JSON.parse(dataStr);
+                    state.visitedLocations = data.visitedLocations || [];
+                    updateStatus('location-count', state.visitedLocations.length);
+                    drawFog();
+                }
+            } catch (error) {
+                console.error('Failed to load from localStorage:', error);
+                showError('Failed to load saved data');
+            }
+        }
+
+        // Clear all data
+        function clearAllData() {
+            if (!confirm('Are you sure you want to reset all data? This cannot be undone.')) {
+                return;
+            }
+
+            state.visitedLocations = [];
+            localStorage.removeItem(CONFIG.STORAGE_KEY);
+            updateStatus('location-count', 0);
+            drawFog();
+        }
+
+        // Center map on current location
+        function centerOnCurrentLocation() {
+            if (state.currentPosition) {
+                state.map.setView([state.currentPosition.lat, state.currentPosition.lng], 16);
+            } else if (state.visitedLocations.length > 0) {
+                const lastLocation = state.visitedLocations[state.visitedLocations.length - 1];
+                state.map.setView([lastLocation.lat, lastLocation.lng], 16);
+            } else {
+                showError('No location available yet');
+            }
+        }
+
+        // Setup event listeners
+        function setupEventListeners() {
+            document.getElementById('center-btn').addEventListener('click', centerOnCurrentLocation);
+            document.getElementById('reset-btn').addEventListener('click', clearAllData);
+        }
+
+        // Update status display
+        function updateStatus(elementId, value) {
+            document.getElementById(elementId).textContent = value;
+        }
+
+        // Show error message
+        function showError(message) {
+            const errorEl = document.getElementById('error-msg');
+            errorEl.textContent = message;
+            setTimeout(() => {
+                errorEl.textContent = '';
+            }, 5000);
+        }
+
+        // Start the application
+        window.addEventListener('DOMContentLoaded', init);
+    </script>
+</body>
+</html>
