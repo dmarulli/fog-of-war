@@ -45,63 +45,60 @@
             top: 10px;
             right: 10px;
             z-index: 1001;
-            background: white;
-            padding: 15px;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-            max-width: 250px;
-        }
-
-        #status {
-            font-size: 12px;
-            color: #666;
-            margin-bottom: 10px;
-            line-height: 1.4;
-        }
-
-        .status-label {
-            font-weight: 600;
-            color: #333;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
         }
 
         button {
-            width: 100%;
-            padding: 10px;
-            margin-top: 8px;
+            width: 44px;
+            height: 44px;
+            padding: 0;
             border: none;
-            border-radius: 4px;
-            font-size: 14px;
+            border-radius: 50%;
+            font-size: 24px;
             cursor: pointer;
-            transition: background-color 0.2s;
+            transition: all 0.2s;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+            background: white;
+            color: #333;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        button:hover {
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            transform: scale(1.05);
+        }
+
+        button:active {
+            transform: scale(0.95);
         }
 
         #center-btn {
-            background: #007bff;
-            color: white;
-        }
-
-        #center-btn:hover {
-            background: #0056b3;
+            background: white;
+            color: #007bff;
         }
 
         #reset-btn {
-            background: #dc3545;
-            color: white;
-        }
-
-        #reset-btn:hover {
-            background: #c82333;
-        }
-
-        #reset-btn:disabled {
-            background: #ccc;
-            cursor: not-allowed;
+            background: white;
+            color: #dc3545;
         }
 
         .error {
             color: #dc3545;
             font-size: 12px;
-            margin-top: 10px;
+            background: white;
+            padding: 8px 12px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+            max-width: 200px;
+            display: none;
+        }
+
+        .error:not(:empty) {
+            display: block;
         }
     </style>
 </head>
@@ -110,13 +107,8 @@
     <canvas id="fog-canvas"></canvas>
 
     <div id="controls">
-        <div id="status">
-            <div><span class="status-label">GPS:</span> <span id="gps-status">Initializing...</span></div>
-            <div><span class="status-label">Locations:</span> <span id="location-count">0</span></div>
-            <div><span class="status-label">Accuracy:</span> <span id="accuracy">--</span></div>
-        </div>
-        <button id="center-btn">Center on My Location</button>
-        <button id="reset-btn">Reset All Data</button>
+        <button id="center-btn" title="Center on My Location">⊙</button>
+        <button id="reset-btn" title="Reset All Data">↻</button>
         <div id="error-msg" class="error"></div>
     </div>
 
@@ -128,8 +120,8 @@
     <script>
         // Configuration
         const CONFIG = {
-            FOG_COLOR: 'rgba(0, 0, 0, 0.85)',
-            FOG_REVEAL_RADIUS: 100, // meters
+            FOG_COLOR: 'rgba(255, 255, 255, 0.9)',
+            FOG_REVEAL_RADIUS: 20, // meters
             GPS_MIN_MOVEMENT: 20, // meters
             GPS_UPDATE_INTERVAL: 10000, // ms
             GPS_MAX_ACCURACY: 100, // meters
@@ -275,11 +267,8 @@
         function initGeolocation() {
             if (!navigator.geolocation) {
                 showError('Geolocation is not supported by your browser');
-                updateStatus('gps-status', 'Not supported');
                 return;
             }
-
-            updateStatus('gps-status', 'Requesting permission...');
 
             const options = {
                 enableHighAccuracy: true,
@@ -297,9 +286,6 @@
         // Handle position update
         function onPositionUpdate(position) {
             const { latitude, longitude, accuracy } = position.coords;
-
-            updateStatus('gps-status', 'Active');
-            updateStatus('accuracy', `±${Math.round(accuracy)}m`);
 
             // Filter out low-accuracy readings
             if (accuracy > CONFIG.GPS_MAX_ACCURACY) {
@@ -341,7 +327,6 @@
                     message = 'Unknown location error';
             }
             showError(message);
-            updateStatus('gps-status', 'Error');
         }
 
         // Add a new visited location
@@ -360,7 +345,6 @@
                 state.visitedLocations.shift();
             }
 
-            updateStatus('location-count', state.visitedLocations.length);
             drawFog();
             saveToLocalStorage();
         }
@@ -407,7 +391,6 @@
                 if (dataStr) {
                     const data = JSON.parse(dataStr);
                     state.visitedLocations = data.visitedLocations || [];
-                    updateStatus('location-count', state.visitedLocations.length);
                     drawFog();
                 }
             } catch (error) {
@@ -424,7 +407,6 @@
 
             state.visitedLocations = [];
             localStorage.removeItem(CONFIG.STORAGE_KEY);
-            updateStatus('location-count', 0);
             drawFog();
         }
 
@@ -444,11 +426,6 @@
         function setupEventListeners() {
             document.getElementById('center-btn').addEventListener('click', centerOnCurrentLocation);
             document.getElementById('reset-btn').addEventListener('click', clearAllData);
-        }
-
-        // Update status display
-        function updateStatus(elementId, value) {
-            document.getElementById(elementId).textContent = value;
         }
 
         // Show error message
